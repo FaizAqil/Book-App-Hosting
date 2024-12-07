@@ -1,41 +1,53 @@
 from flask import Flask, request, jsonify
-from google.cloud import firestore, storage
+from google.cloud import storage, firestore
 import tensorflow as tf
-import requests
 import os
-from werkzeug.utils import secure_filename
 import numpy as np
+import pandas as pd
+from io import StringIO
 
 app = Flask(__name__)
 
-# Inisialisasi Firestore dan Google Cloud Storage
-db = firestore.Client()
-storage_client = storage.Client()
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'serviceaccountkey.json'
+BUCKET_NAME = 'storage-ml-similliar'
+CSV_FILE_PATH = 'dataset-book/dataset_book.csv'
 
-# URL publik model .h5 di Google Cloud Storage
-model_url = os.getenv('MODEL_URL', 'https://storage.googleapis.com/storage-ml-similliar/model-book/book_recommendation_model.h5')
+def initialize_firestore():
+    try:
+        db = firestore.Client()
+        print("Firestore initialized successfully.")
+        return db
+    except Exception as e:
+        print(f"Error initializing Firestore: {e}")
+        return None
 
-# Unduh model dari URL publik
-model_path = 'book_recommendation_model.h5'
-try:
-    response = requests.get(model_url)
-    response.raise_for_status()  # Memicu kesalahan jika status bukan 200
-    with open(model_path, 'wb') as f:
-        f.write(response.content)
-except requests.RequestException as e:
-    print(f"Error downloading model: {e}")
-    exit(1)
+db = initialize_firestore()
 
-# Muat model dari file .h5
-try:
-    model = tf.keras.models.load_model(model_path)
-except Exception as e:
-    print(f"Error loading model: {e}")
-    exit(1)
+if db is None:
+    print("Firestore could not be initialized. Exiting the application.")
+    exit(1)  
 
-def is_image_file(filename):
-    allowed_extensions = {'png', 'jpg', 'jpeg', 'gif'}
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
+model = tf.keras.models.load_model('book_recommendation_model.h5')
+
+def download_blob(bucket_name, source_blob_name):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(source_blob_name)
+
+    data = blob.download_as_text()
+    return data
+
+csv_data = download_blob(BUCKET_NAME, CSV_FILE_PATH)
+df = pd.read_csv(StringIO(csv_data))
+
+# Fungsi untuk menyimpan gambar ke Google Cloud Storage
+def upload_blob(bucket_name, source_file_name, destination_blob_name):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+
+    blob.upload_from_filename(source_file_name)
+    print(f"File {source_file_name} uploaded to {destination_blob_name}.")
 
 @app.route("/")
 def index():
@@ -47,40 +59,52 @@ def index():
         "data": None
     }), 200
 
+# Endpoint untuk upload buku dan rating
 @app.route('/upload', methods=['POST'])
 def upload():
-    user_data = request.json
-    file = request.files.get('file')
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
 
-    # Validasi input
-    if not user_data or not user_data.get('user_id') or not user_data.get('title') or not user_data.get('review'):
-        return jsonify({"error": "user_id, title, and review are required"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
 
-    # Periksa apakah file ada dan merupakan gambar
-    if file and is_image_file(file.filename):
-        filename = secure_filename(file.filename)
+    file_path = f"./{file.filename}"
+    file.save(file_path)
 
-        # Upload file ke Google Cloud Storage
-        bucket_name = os.getenv('BUCKET_NAME', 'online-book-borrowing-cloudrun')
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(filename)
+    upload_blob(BUCKET_NAME, file_path, file.filename)
 
-        # Pastikan file dapat dibaca
-        file.seek(0)
-        blob.upload_from_string(file.read(), content_type=file.content_type)
+    book_info = {
+        'name': request.form['name'],
+        'id': request.form['id'],
+        'author': request.form['author'],
+        'rating': float(request.form['rating'].replace(',', '.')),  
+        'user': request.form['user']  
+    }
 
-        # Simpan informasi buku ke Firestore
-        book_data = {
-            'user_id': user_data.get('user_id'),
-            'title': user_data.get('title'),
-            'review': user_data.get('review'),
-            'file_url': blob.public_url
-        }
-        db.collection('books').add(book_data)
+    try:
+        db.collection('books').document(book_info['id']).set(book_info)
+    except Exception as e:
+        return jsonify({'error': f'Failed to save to Firestore: {e}'}), 500
 
-        return jsonify({"message": "Book uploaded successfully", "file_url": blob.public_url}), 201
-    else:
-        return jsonify({"error": "Invalid file type. Only image files are allowed."}), 400
+    global df  
+    new_entry = {
+        'user': book_info['user'],
+        'book': book_info['id'],
+        'review/score': book_info['rating']
+    }
+    df = df.append(new_entry, ignore_index=True)
+
+    book_features = df[df['title'] == book_info['name']].iloc[:, 1:].values 
+    predicted_rating = model.predict(book_features)
+
+    updated_rating = (book_info['rating'] + predicted_rating[0]) / 2
+
+    df.loc[df['title'] == book_info['name'], 'average_rating'] = updated_rating
+
+    os.remove(file_path)
+
+    return jsonify({'message': 'File uploaded successfully', 'book_info': book_info, 'updated_rating': updated_rating}), 200
 
 @app.route('/get_buku', methods=['GET'])
 def get_buku():
@@ -89,69 +113,42 @@ def get_buku():
 
     book_list = []
     for book in books:
-        book_data = book.to_dict()
-        book_data['id'] = book.id
-        book_list.append(book_data)
+        book_list.append(book.to_dict())
 
-    return jsonify({"books": book_list})
+    return jsonify({'message': 'Daftar buku', 'data': book_list}), 200
 
 @app.route('/rekomendasi', methods=['POST'])
 def rekomendasi():
-    book_id = request.json.get('book_id')
-    if not book_id:
-        return jsonify({"error": "book_id is required"}), 400
+    data = request.json
+    book_title = data['book_title']
 
-    # Mendapatkan rekomendasi buku mirip
-    try:
-        similar_books = get_similar_books(book_id)
-        return jsonify({"recommendations": similar_books})
-    except Exception as e:
-        return jsonify({"error": f"Failed to generate recommendations: {str(e)}"}), 500
+    book_features = df[df['title'] == book_title].iloc[:, 1:].values 
 
-def get_book_data(book_id):
-    book_ref = db.collection('books').document(book_id)
-    book = book_ref.get()
-    if not book.exists:
-        raise ValueError("Book not found")
-    return book.to_dict()
+    predictions = model.predict(book_features)
 
-def prepare_input_for_model(book_data):
-    features = ['feature1', 'feature2', 'feature3']  # Ganti dengan nama fitur yang sesuai
-    input_data = [book_data.get(feature, 0) for feature in features]
-    return np.array(input_data).reshape(1, -1)
+    recommended_indices = np.argsort(predictions[0])[-5:]  
+    recommended_books = df.iloc[recommended_indices]
 
-def get_similar_books(book_id):
-    book_data = get_book_data(book_id)
-    input_data = prepare_input_for_model(book_data)
-
-    # Gunakan model untuk mendapatkan rekomendasi buku mirip
-    predictions = model.predict(input_data)
-    return predictions.flatten().tolist()
+    return jsonify(recommended_books.to_dict(orient='records')), 200
 
 @app.route('/rating', methods=['POST'])
 def rating():
-    rating_data = request.json
-    book_id = rating_data.get('book_id')
-    rating_value = rating_data.get('rating')
+    data = request.json
 
-    if not book_id or rating_value is None:
-        return jsonify({"error": "book_id and rating are required"}), 400
+    user = data['user']
+    book = data['book']
 
-    # Simpan rating ke Firestore
-    book_ref = db.collection('books').document(book_id)
-    book = book_ref.get()
-    if not book.exists:
-        return jsonify({"error": "Book not found"}), 404
+    review_score = df[(df['user'] == user) & (df['book'] == book)]['review/score']
 
-    book_ref.update({
-        'ratings': firestore.ArrayUnion([rating_value])
-    })
+    if review_score.empty:
+        return jsonify({'error': 'No review found for this user and book'}), 404
 
-    return jsonify({"message": "Rating submitted successfully"}), 201
+    min_rating = df['review/score'].min()
+    max_rating = df['review/score'].max()
 
-@app.errorhandler(Exception)
-def handle_exception(e):
-    return jsonify({"error": str(e)}), 500
+    normalized_score = (review_score.values[0] - min_rating) / (max_rating - min_rating)
+
+    return jsonify({'normalized_score': normalized_score}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    app.run(debug=True)
